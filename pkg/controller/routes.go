@@ -55,7 +55,7 @@ func routes(router *router.Router, registryTransport http.RoundTripper) {
 	appRouter.HandlerFunc(appdefinition.VolumeStatus)
 	appRouter.HandlerFunc(appdefinition.ReadyStatus)
 	appRouter.HandlerFunc(appdefinition.AddAcornProjectLabel)
-	appRouter.HandlerFunc(appdefinition.NetworkPolicy)
+	appRouter.HandlerFunc(appdefinition.NetworkPolicyForApp)
 	appRouter.HandlerFunc(appdefinition.UpdateGeneration)
 
 	router.Type(&v1.AppInstance{}).HandlerFunc(appdefinition.CLIStatus)
@@ -74,7 +74,9 @@ func routes(router *router.Router, registryTransport http.RoundTripper) {
 	router.Type(&corev1.Service{}).Namespace(system.Namespace).HandlerFunc(gc.GCOrphans)
 	router.Type(&corev1.Pod{}).Selector(managedSelector).HandlerFunc(gc.GCOrphans)
 	router.Type(&netv1.Ingress{}).Selector(managedSelector).Middleware(ingress.RequireLBs).Handler(ingress.NewDNSHandler())
+	router.Type(&netv1.Ingress{}).Selector(managedSelector).HandlerFunc(appdefinition.NetworkPolicyForIngress)
 	router.Type(&corev1.Secret{}).Selector(managedSelector).Middleware(tls.RequireSecretTypeTLS).HandlerFunc(tls.RenewCert) // renew (expired) TLS certificates, including the on-acorn.io wildcard cert
+	router.Type(&corev1.Service{}).Selector(managedSelector).HandlerFunc(appdefinition.NetworkPolicyForService)
 	router.Type(&storagev1.StorageClass{}).HandlerFunc(volume.SyncVolumeClasses)
 
 	configRouter := router.Type(&corev1.ConfigMap{}).Namespace(system.Namespace).Name(system.ConfigName)

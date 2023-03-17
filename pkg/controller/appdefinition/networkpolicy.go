@@ -5,17 +5,14 @@ import (
 	v1 "github.com/acorn-io/acorn/pkg/apis/internal.acorn.io/v1"
 	"github.com/acorn-io/acorn/pkg/config"
 	"github.com/acorn-io/acorn/pkg/labels"
-	"github.com/acorn-io/baaah/pkg/merr"
 	"github.com/acorn-io/baaah/pkg/router"
+	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"net"
-	"strconv"
-	"strings"
 )
 
-func NetworkPolicy(req router.Request, resp router.Response) error {
+func NetworkPolicyForApp(req router.Request, resp router.Response) error {
 	cfg, err := config.Get(req.Ctx, req.Client)
 	if err != nil {
 		return err
@@ -27,7 +24,8 @@ func NetworkPolicy(req router.Request, resp router.Response) error {
 	appNamespace := app.Namespace        // this is where the AppInstance lives
 	podNamespace := app.Status.Namespace // this is where the app is actually running
 
-	// first, create the NetworkPolicy for the whole app
+	// create the NetworkPolicy for the whole app
+	// this allows traffic only from within the project
 	resp.Objects(&networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      app.Name,
@@ -49,128 +47,153 @@ func NetworkPolicy(req router.Request, resp router.Response) error {
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		},
 	})
+	return nil
+}
 
-	ingressNamespace := *cfg.IngressControllerNamespace
-	podCIDRs := cfg.PodCIDRs
+func NetworkPolicyForIngress(req router.Request, resp router.Response) error {
+	cfg, err := config.Get(req.Ctx, req.Client)
+	if err != nil {
+		return err
+	} else if *cfg.DisableNetworkPolicies {
+		return nil
+	}
 
-	// make sure the podCIDRs are valid
-	var errs []error
-	for _, cidr := range podCIDRs {
-		if cidr != "" {
-			_, _, err = net.ParseCIDR(cidr)
-			if err != nil {
-				errs = append(errs, err)
-			}
+	ingress := req.Object.(*networkingv1.Ingress)
+	appName := ingress.Labels[labels.AcornAppName]
+	projectName := ingress.Labels[labels.AcornAppNamespace]
+
+	// create a mapping of k8s Service names to published port names/numbers
+	svcNameToPorts := make(map[string][]networkingv1.ServiceBackendPort)
+	for _, rule := range ingress.Spec.Rules {
+		for _, path := range rule.HTTP.Paths {
+			svcName := path.Backend.Service.Name
+			port := path.Backend.Service.Port
+			svcNameToPorts[svcName] = append(svcNameToPorts[svcName], port)
 		}
 	}
-	if len(errs) > 0 {
-		return merr.NewErrors(errs...)
-	}
 
-	// next, create NetworkPolicies for each container and job in the app that has a published port
-	for containerName, container := range app.Status.AppSpec.Containers {
-		buildNetPolsForContainer(app.Name, containerName, podNamespace, ingressNamespace, podCIDRs, container, resp)
-	}
-	for jobName, job := range app.Status.AppSpec.Jobs {
-		buildNetPolsForContainer(app.Name, jobName, podNamespace, ingressNamespace, podCIDRs, job, resp)
+	for svcName, ports := range svcNameToPorts {
+		// get the Service from k8s
+		svc := corev1.Service{}
+		err = req.Get(&svc, ingress.Namespace, svcName)
+		if err != nil {
+			return err
+		}
+
+		acornServiceName := svc.Labels[labels.AcornServiceName]
+
+		// build the namespaceSelector for the NetPol
+		var namespaceSelector metav1.LabelSelector
+		if *cfg.IngressControllerNamespace != "" {
+			namespaceSelector = metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": *cfg.IngressControllerNamespace,
+				},
+			}
+		}
+
+		// build the port slice for the NetPol
+		var netPolPorts []networkingv1.NetworkPolicyPort
+		for _, port := range ports {
+			// try to map this ingress port to a port on the service
+			for _, svcPort := range svc.Spec.Ports {
+				if (svcPort.Name != "" && svcPort.Name == port.Name) || svcPort.Port == port.Number {
+					targetPort := svcPort.TargetPort
+					netPolPorts = append(netPolPorts, networkingv1.NetworkPolicyPort{
+						Protocol: &[]corev1.Protocol{corev1.ProtocolTCP}[0],
+						Port:     &targetPort,
+					})
+				}
+			}
+		}
+
+		if len(netPolPorts) == 0 {
+			logrus.Warnf("found no matching ports between Ingress %s and Service %s in Namespace %s", ingress.Name, svcName, ingress.Namespace)
+			continue
+		}
+
+		// build the NetPol
+		resp.Objects(&networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-%s-%s-%s-%s", projectName, appName, ingress.Name, svcName, acornServiceName),
+				Namespace: ingress.Namespace,
+			},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{
+					MatchLabels: svc.Spec.Selector, // the NetPol will target the same pods that the service targets
+				},
+				Ingress: []networkingv1.NetworkPolicyIngressRule{{
+					From: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &namespaceSelector,
+						},
+						{
+							NamespaceSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"kubernetes.io/metadata.name": "acorn-system",
+								},
+							},
+						},
+					},
+					Ports: netPolPorts,
+				}},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			},
+		})
 	}
 
 	return nil
 }
 
-func buildNetPolsForContainer(appName, containerName, podNamespace, ingressNamespace string, podCIDRs []string, container v1.Container, resp router.Response) {
-	for _, port := range container.Ports {
-		if port.Publish {
-			if port.Protocol == v1.ProtocolHTTP {
-				resp.Objects(buildNetPolForHTTPPublishedPort(
-					fmt.Sprintf("%s-%s-%s", strings.ToLower(appName), strings.ToLower(containerName), strconv.Itoa(int(port.Port))),
-					podNamespace, ingressNamespace, containerName, port.Port))
-			} else {
-				resp.Objects(buildNetPolForOtherPublishedPort(
-					fmt.Sprintf("%s-%s-%s", strings.ToLower(appName), strings.ToLower(containerName), strconv.Itoa(int(port.Port))),
-					podNamespace, containerName, podCIDRs, port.Port))
-			}
-		}
-	}
-	// create policies for the sidecars as well
-	for sidecarName, sidecar := range container.Sidecars {
-		for _, port := range sidecar.Ports {
-			if port.Publish {
-				if port.Protocol == v1.ProtocolHTTP {
-					resp.Objects(buildNetPolForHTTPPublishedPort(
-						fmt.Sprintf("%s-%s-sidecar-%s-%s", strings.ToLower(appName), strings.ToLower(containerName), strings.ToLower(sidecarName), strconv.Itoa(int(port.Port))),
-						podNamespace, ingressNamespace, containerName, port.Port))
-				} else {
-					resp.Objects(buildNetPolForOtherPublishedPort(
-						fmt.Sprintf("%s-%s-sidecar-%s-%s", strings.ToLower(appName), strings.ToLower(containerName), strings.ToLower(sidecarName), strconv.Itoa(int(port.Port))),
-						podNamespace, containerName, podCIDRs, port.Port))
-				}
-			}
-		}
-	}
-}
-
-func buildNetPolForHTTPPublishedPort(name, namespace, ingressNamespace, containerName string, port int32) *networkingv1.NetworkPolicy {
-	var namespaceSelector metav1.LabelSelector
-	if ingressNamespace != "" {
-		namespaceSelector = metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"kubernetes.io/metadata.name": ingressNamespace,
-			},
-		}
+func NetworkPolicyForService(req router.Request, resp router.Response) error {
+	cfg, err := config.Get(req.Ctx, req.Client)
+	if err != nil {
+		return err
+	} else if *cfg.DisableNetworkPolicies {
+		return nil
 	}
 
-	return &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					labels.AcornContainerName: containerName,
-				},
-			},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{
-				From: []networkingv1.NetworkPolicyPeer{{
-					NamespaceSelector: &namespaceSelector,
-				}},
-				Ports: []networkingv1.NetworkPolicyPort{{
-					Port: &intstr.IntOrString{
-						IntVal: port,
-					}},
-				}},
-			},
-			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-		},
-	}
-}
+	service := req.Object.(*corev1.Service)
 
-// For now, we lock down published TCP/UDP ports by allowing access from all pods in kube-system
-// and all IP addresses that aren't part of the pod CIDR.
-// This blocks traffic coming from pods from other projects (since their IPs are in the pod CIDR),
-// but it allows traffic coming from klipper pods in kube-system (which might be doing the load balancing),
-// and from nodes or load balancers that are from a cloud provider.
-func buildNetPolForOtherPublishedPort(name, namespace, containerName string, podCIDRs []string, port int32) *networkingv1.NetworkPolicy {
+	// we only care about LoadBalancer services that were created for published TCP/UDP ports
+	if service.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		return nil
+	}
+
+	appName := service.Labels[labels.AcornAppName]
+	projectName := service.Labels[labels.AcornAppNamespace]
+	acornServiceName := service.Labels[labels.AcornServiceName]
+
+	// build the ipBlock for the NetPol
 	ipBlock := networkingv1.IPBlock{
 		CIDR: "0.0.0.0/0",
 	}
-	for _, cidr := range podCIDRs {
+	for _, cidr := range cfg.PodCIDRs {
 		if cidr != "" {
 			ipBlock.Except = append(ipBlock.Except, cidr)
 		}
 	}
 
-	return &networkingv1.NetworkPolicy{
+	// build the port slice for the NetPol
+	var netPolPorts []networkingv1.NetworkPolicyPort
+	for _, port := range service.Spec.Ports {
+		proto := port.Protocol
+		targetPort := port.TargetPort
+		netPolPorts = append(netPolPorts, networkingv1.NetworkPolicyPort{
+			Protocol: &proto,
+			Port:     &targetPort,
+		})
+	}
+
+	// build the NetPol
+	resp.Objects(&networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:      fmt.Sprintf("%s-%s-%s-%s", projectName, appName, service.Name, acornServiceName),
+			Namespace: service.Namespace,
 		},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					labels.AcornContainerName: containerName,
-				},
+				MatchLabels: service.Spec.Selector, // the NetPol will target the same pods that the service targets
 			},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{{
 				From: []networkingv1.NetworkPolicyPeer{
@@ -184,14 +207,19 @@ func buildNetPolForOtherPublishedPort(name, namespace, containerName string, pod
 							},
 						},
 					},
+					{
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"kubernetes.io/metadata.name": "acorn-system",
+							},
+						},
+					},
 				},
-				Ports: []networkingv1.NetworkPolicyPort{{
-					Port: &intstr.IntOrString{
-						IntVal: port,
-					}},
-				}},
-			},
+				Ports: netPolPorts,
+			}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		},
-	}
+	})
+
+	return nil
 }
