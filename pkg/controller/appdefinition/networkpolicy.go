@@ -12,6 +12,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// NetworkPolicyForApp creates a single Kubernetes NetworkPolicy that restricts incoming network traffic
+// to all pods in an app, so that they cannot be reached by pods from other projects.
 func NetworkPolicyForApp(req router.Request, resp router.Response) error {
 	cfg, err := config.Get(req.Ctx, req.Client)
 	if err != nil {
@@ -50,6 +52,9 @@ func NetworkPolicyForApp(req router.Request, resp router.Response) error {
 	return nil
 }
 
+// NetworkPolicyForIngress creates Kubernetes NetworkPolicies to allow traffic to exposed HTTP ports on
+// Acorn apps from the ingress controller. If the ingress controller namespace is not defined, traffic from
+// all namespaces will be allowed instead.
 func NetworkPolicyForIngress(req router.Request, resp router.Response) error {
 	cfg, err := config.Get(req.Ctx, req.Client)
 	if err != nil {
@@ -77,6 +82,8 @@ func NetworkPolicyForIngress(req router.Request, resp router.Response) error {
 		svc := corev1.Service{}
 		err = req.Get(&svc, ingress.Namespace, svcName)
 		if err != nil {
+			// is this okay to do? sometimes the Service doesn't exist yet when we need to get it
+			// so errors might occasionally appear in the logs but things eventually settle and work
 			return err
 		}
 
@@ -145,6 +152,9 @@ func NetworkPolicyForIngress(req router.Request, resp router.Response) error {
 	return nil
 }
 
+// NetworkPolicyForService creates a Kubernetes NetworkPolicy to allow traffic to published TCP/UDP ports
+// on Acorn apps that are exposed with LoadBalancer Services. Traffic will be allowed from all IP addresses,
+// but can be restricted by providing the pod IP address range (--pod-cidr) during Acorn installation.
 func NetworkPolicyForService(req router.Request, resp router.Response) error {
 	cfg, err := config.Get(req.Ctx, req.Client)
 	if err != nil {

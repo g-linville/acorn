@@ -9,3 +9,11 @@ import (
 func TestNetworkPolicyForApp(t *testing.T) {
 	tester.DefaultTest(t, scheme.Scheme, "testdata/networkpolicy/appinstance", NetworkPolicyForApp)
 }
+
+func TestNetworkPolicyForIngress(t *testing.T) {
+	tester.DefaultTest(t, scheme.Scheme, "testdata/networkpolicy/ingress", NetworkPolicyForIngress)
+}
+
+func TestNetworkPolicyForService(t *testing.T) {
+	tester.DefaultTest(t, scheme.Scheme, "testdata/networkpolicy/service", NetworkPolicyForService)
+}
