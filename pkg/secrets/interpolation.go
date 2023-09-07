@@ -255,6 +255,8 @@ func (i *Interpolator) resolveApp(keyName string) (string, bool, error) {
 	case "externalid":
 		externalID, err := i.getExternalID()
 		return externalID, true, err
+	case "region":
+		return i.app.GetRegion(), true, nil
 	}
 	return "", false, nil
 }
